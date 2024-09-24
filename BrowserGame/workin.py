@@ -1,0 +1,492 @@
+# /backend/game_app/game_state.py
+from channels.layers import get_channel_layer
+from asgiref.sync import async_to_sync, sync_to_async
+import json, asyncio, math, time
+from .models import Map, MapTile
+
+class GameState:
+    def __init__(self):
+        self.players = {}
+        self.player_mouse_positions = {}        
+        self.gravity = -55
+        self.update_interval = 1/60
+        self.jump_velocity = 11
+        self.physics_task = None
+        self.tile_width = 1
+        self.tile_height = 1
+        self.player_width = 1
+        self.player_height = 2
+        self.map_data = None
+        self.map_id = 3
+        self.max_arm_length = 0.8
+        self.min_arm_length = 0.2
+        self.upper_arm_length = 0.2
+        self.forearm_length = 0.4
+        self.player_guard_states = {}        
+        self.animation_frames = {
+            'IDLE': {
+                'top_head': [0.65, 0.1],
+                'neck': [0.5, 0.5],
+                'l_elbow': [0.25, 0.8],
+                'r_shoulder': [0.65, 0.6],
+                'l_hand': [0.2, 1.2],
+                'spine_01': [0.5, 0.65],
+                'spine_02': [0.475, 0.9],
+                'pelvis': [0.45, 1.1],
+                'l_knee': [0.4, 1.55],
+                'r_knee': [0.75, 1.55],
+                'l_ankle': [0.2, 1.95],
+                'r_ankle': [0.72, 1.95],
+                'l_toe': [0.28, 1.95],
+                'r_toe': [0.8, 1.95]
+            },
+            'WALK_BACK': {
+                'top_head': [0.65, 0.1],
+                'neck': [0.4, 0.5],
+                'l_elbow': [0.25, 0.8],
+                'r_shoulder': [0.65, 0.6],
+                'l_hand': [0.2, 1.2],
+                'spine_01': [0.43, 0.65],
+                'spine_02': [0.42, 0.9],
+                'pelvis': [0.4, 1.1],
+                'l_knee': [0.3, 1.55],
+                'r_knee': [0.6, 1.55],
+                'l_ankle': [0.05, 1.95],
+                'r_ankle': [0.72, 1.95],
+                'l_toe': [0.13, 1.95],
+                'r_toe': [0.8, 1.95]
+            },
+            'WALK_BACK_FOOT_UP': {
+                'top_head': [0.625, 0.075],
+                'neck': [0.45, 0.45],
+                'l_elbow': [0.25, 0.8],
+                'r_shoulder': [0.65, 0.6],
+                'l_hand': [0.2, 1.2],
+                'spine_01': [0.43, 0.75],
+                'spine_02': [0.42, 1.0],
+                'pelvis': [0.43, 1.2],
+                'l_knee': [0.35, 1.4],
+                'r_knee': [0.6, 1.55],
+                'l_ankle': [0.12, 1.85],
+                'r_ankle': [0.72, 1.9],
+                'l_toe': [0.2, 1.87],
+                'r_toe': [0.8, 1.95]
+            },
+            'WALK_FORWARD': {
+                'top_head': [0.675, 0.1],
+                'neck': [0.55, 0.5],
+                'l_elbow': [0.25, 0.8],
+                'r_shoulder': [0.65, 0.6],
+                'l_hand': [0.2, 1.2],
+                'spine_01': [0.55, 0.65],
+                'spine_02': [0.525, 0.9],
+                'pelvis': [0.5, 1.1],
+                'l_knee': [0.4, 1.55],
+                'r_knee': [0.8, 1.55],
+                'l_ankle': [0.2, 1.95],
+                'r_ankle': [0.85, 1.95],
+                'l_toe': [0.28, 1.95],
+                'r_toe': [0.93, 1.9]
+            },
+            'WALK_FORWARD_FOOT_UP': {
+                'top_head': [0.675, 0.075],
+                'neck': [0.55, 0.5],
+                'l_elbow': [0.25, 0.8],
+                'r_shoulder': [0.65, 0.6],
+                'l_hand': [0.2, 1.2],
+                'spine_01': [0.55, 0.65],
+                'spine_02': [0.525, 0.9],
+                'pelvis': [0.5, 1.1],
+                'l_knee': [0.485, 1.65],
+                'r_knee': [0.8, 1.4],
+                'l_ankle': [0.3, 1.9],
+                'r_ankle': [0.85, 1.85],
+                'l_toe': [0.38, 1.9],
+                'r_toe': [0.93, 1.9]
+            }
+        }
+        self.animation_sequence_forward = ['IDLE', 'WALK_FORWARD_FOOT_UP', 'WALK_FORWARD', 'WALK_FORWARD_FOOT_UP']
+        self.animation_sequence_backward = ['IDLE', 'WALK_BACK_FOOT_UP', 'WALK_BACK', 'WALK_BACK_FOOT_UP']
+        self.animation_duration = 0.1  # Duration for each animation frame in seconds
+        self.player_animation_states = {}
+
+    @sync_to_async
+    def _get_map_data(self):
+        try:
+            map_obj = Map.objects.get(id=self.map_id)
+            return {
+                'name': map_obj.name,
+                'width': map_obj.width,
+                'height': map_obj.height,
+                'tiles': list(map_obj.tiles.values('x', 'y', 'color', 'layer'))
+            }
+        except Map.DoesNotExist:
+            print(f"Map with id {self.map_id} not found")
+            return None
+
+    async def load_map_data(self):
+        self.map_data = await self._get_map_data()
+        if self.map_data:
+            print("Map data loaded:")
+            print(f"Map dimensions: {self.map_data['width']}x{self.map_data['height']}")
+            print("Layer 1 tiles:")
+            for tile in self.map_data['tiles']:
+                if tile['layer'] == 1:
+                    print(f"x: {tile['x']}, y: {tile['y']}")
+        else:
+            print(f"Failed to load map data for map_id: {self.map_id}")
+
+    def get_ground_level(self, x):
+        if not self.map_data:
+            return 0
+
+        player_left = int(x)
+        player_right = int(x + self.player_width)
+        
+        # Start from the bottom of the map and work upwards
+        for y in range(self.map_data['height']):
+            for tile in self.map_data['tiles']:
+                if (tile['layer'] == 1 and 
+                    player_left <= tile['x'] < player_right and 
+                    tile['y'] == y):
+                    # We've found a ground tile, return its y-coordinate
+                    ground_level = self.map_data['height'] - y - 2
+                    print(f"Ground level at x={x}: {ground_level}")  # Debug print
+                    return ground_level
+
+        # If no ground tile is found, return the bottom of the map
+        print(f"No ground found at x={x}, returning 0")  # Debug print
+        return 0
+
+    def check_horizontal_collision(self, player, new_x):
+        player_left = new_x
+        player_right = new_x + self.player_width
+        player_bottom = self.map_data['height'] - player['y']
+        player_top = self.map_data['height'] - player['y'] - self.player_height
+
+        for tile in self.map_data['tiles']:
+            if tile['layer'] == 1:
+                tile_left = tile['x']
+                tile_right = tile['x'] + self.tile_width
+                tile_top = tile['y']
+                tile_bottom = tile['y'] + self.tile_height
+
+                if (player_left < tile_right and player_right > tile_left and
+                    player_top < tile_bottom and player_bottom > tile_top):
+                    return True
+        return False
+
+    async def start_physics_update(self):
+        if not self.physics_task:
+            print("Starting physics update loop")
+            self.physics_task = asyncio.create_task(self._physics_loop())
+
+    async def stop_physics_update(self):
+        if self.physics_task:
+            self.physics_task.cancel()
+            self.physics_task = None
+            print("Shutting down physics update loop")
+
+    async def _physics_loop(self):
+        while True:
+            await self.physics_update()
+            await asyncio.sleep(self.update_interval)
+
+    async def physics_update(self):
+        for player_id, player in self.players.items():
+            old_y = player['y']
+            old_x = player['x']
+            
+            player['vy'] += self.gravity * self.update_interval
+            new_y = player['y'] + player['vy'] * self.update_interval
+            
+            ground_level = self.get_ground_level(player['x'])
+            if new_y <= ground_level + self.player_height:
+                new_y = ground_level + self.player_height
+                player['vy'] = 0
+            
+            player['y'] = new_y
+            
+            # Update animation state
+            animation_state = self.player_animation_states[player_id]
+            animation_state['is_moving'] = (player['x'] != old_x)
+            if player['x'] > old_x:
+                animation_state['direction'] = 'forward'
+            elif player['x'] < old_x:
+                animation_state['direction'] = 'backward'
+            
+            self.update_pivot_points(player)
+            
+            if old_y != player['y'] or old_x != player['x']:
+                print(f"Physics update for player {player_id}: old_y={old_y}, new_y={player['y']}, vy={player['vy']}, old_x={old_x}, new_x={player['x']}")
+        
+        if self.players:
+            await self.broadcast_state()
+
+    def add_player(self, player_id, x, y):
+        ground_level = self.get_ground_level(x)
+        self.players[player_id] = {'x': float(x), 'y': max(float(y), ground_level), 'vy': 0}
+        self.player_guard_states[player_id] = False
+        
+        # Initialize the player's animation state
+        self.player_animation_states[player_id] = {
+            'current_state': 'IDLE',
+            'next_state': 'IDLE',
+            'transition_progress': 0,
+            'last_update_time': time.time(),
+            'is_moving': False,
+            'direction': 'forward'  # Add direction to track movement direction
+        }
+        
+        # Initialize pivot points for the new player
+        self.players[player_id]['pivot_points'] = self.animation_frames['IDLE'].copy()
+        
+        print(f"Player added: id={player_id}, x={x}, y={self.players[player_id]['y']}, guard={self.player_guard_states[player_id]}")
+
+    def remove_player(self, player_id):
+        if player_id in self.players:
+            del self.players[player_id]
+            del self.player_guard_states[player_id]
+            print(f"Player removed: id={player_id}")
+
+    def update_player_position(self, player_id, x, y):
+        if player_id in self.players:
+            old_x = self.players[player_id]['x']
+            if x is not None:
+                new_x = max(0, min(float(x), self.map_data['width'] - self.player_width))
+                if not self.check_horizontal_collision(self.players[player_id], new_x):
+                    self.players[player_id]['x'] = new_x
+                    
+                    # Set player as moving and update direction
+                    animation_state = self.player_animation_states[player_id]
+                    animation_state['is_moving'] = new_x != old_x
+                    if new_x > old_x:
+                        animation_state['direction'] = 'forward'
+                    elif new_x < old_x:
+                        animation_state['direction'] = 'backward'
+                        
+            if y is not None:
+                ground_level = self.get_ground_level(self.players[player_id]['x'])
+                self.players[player_id]['y'] = max(ground_level, min(float(y), self.map_data['height'] - 1))
+            self.update_pivot_points(self.players[player_id])
+        print(f"Player position updated: id={player_id}, new state={self.players[player_id]}")
+
+    def set_player_animation_state(self, player_id, state):
+        if player_id not in self.player_animation_states:
+            self.player_animation_states[player_id] = {
+                'current_state': state,
+                'target_state': state,
+                'interpolation_factor': 1.0,
+                'velocity': 0.0
+            }
+        else:
+            self.player_animation_states[player_id]['target_state'] = state
+
+    def player_jump(self, player_id):
+        if player_id in self.players:
+            ground_level = self.get_ground_level(self.players[player_id]['x'])
+            if self.players[player_id]['y'] == ground_level + self.player_height:
+                self.players[player_id]['vy'] = self.jump_velocity
+                print(f"Player jumped: id={player_id}, new vy={self.jump_velocity}")
+
+    def convert_mouse_to_pivot_coords(self, mouse_x, mouse_y):
+        # Convert mouse coordinates to pivot point coordinate system
+        pivot_x = mouse_x / 30  # 30 local units = 1 pivot unit
+        pivot_y = mouse_y / 30
+        return pivot_x, pivot_y
+
+    def distance(self, point1, point2):
+        return math.sqrt((point1[0] - point2[0])**2 + (point1[1] - point2[1])**2)
+
+    def mirror_pivot_points(self, pivot_points, mouse_x):
+        mirrored_points = {}
+        for key, point in pivot_points.items():
+            if mouse_x < 0:
+                mirrored_points[key] = [1 - point[0], point[1]]
+            else:
+                mirrored_points[key] = point
+        return mirrored_points
+
+    def update_pivot_points(self, player):
+        player_id = next(id for id, p in self.players.items() if p == player)
+        
+        if player_id not in self.player_animation_states:
+            # If the player doesn't have an animation state yet, initialize it
+            self.player_animation_states[player_id] = {
+                'current_state': 'IDLE',
+                'next_state': 'IDLE',
+                'transition_progress': 0,
+                'last_update_time': time.time(),
+                'is_moving': False,
+                'direction': 'forward'
+            }
+        
+        animation_state = self.player_animation_states[player_id]
+        current_time = time.time()
+        
+        # Calculate time since last update
+        time_since_last_update = current_time - animation_state['last_update_time']
+        animation_state['last_update_time'] = current_time
+
+        # Update transition progress
+        animation_state['transition_progress'] += time_since_last_update / self.animation_duration
+        
+        # If transition is complete, move to next state
+        if animation_state['transition_progress'] >= 1:
+            animation_state['current_state'] = animation_state['next_state']
+            animation_state['transition_progress'] = 0
+
+            if animation_state['is_moving']:
+                # Choose the correct animation sequence based on direction
+                sequence = self.animation_sequence_forward if animation_state['direction'] == 'forward' else self.animation_sequence_backward
+                current_index = sequence.index(animation_state['current_state'])
+                next_index = (current_index + 1) % len(sequence)
+                animation_state['next_state'] = sequence[next_index]
+            else:
+                animation_state['next_state'] = 'IDLE'
+
+        # Interpolate between current and next frame
+        current_frame = self.animation_frames[animation_state['current_state']]
+        next_frame = self.animation_frames[animation_state['next_state']]
+        
+        interpolated_frame = {}
+        for key in current_frame.keys():
+            interpolated_frame[key] = [
+                current_frame[key][0] + (next_frame[key][0] - current_frame[key][0]) * animation_state['transition_progress'],
+                current_frame[key][1] + (next_frame[key][1] - current_frame[key][1]) * animation_state['transition_progress']
+            ]
+        
+        # Update player's pivot points
+        player['pivot_points'] = interpolated_frame
+        
+        # Update arm positions based on mouse position (keep existing arm update logic)
+        mouse_pos = self.player_mouse_positions.get(player_id, {'x': 0, 'y': 0})
+        r_hand_x, r_hand_y = self.convert_mouse_to_pivot_coords(mouse_pos['x'], mouse_pos['y'])
+
+        # Determine if the player is mirrored
+        is_mirrored = mouse_pos['x'] < 15
+
+        # Get the position of the right shoulder
+        r_shoulder_x, r_shoulder_y = player['pivot_points']['r_shoulder']
+
+        # Apply mirroring to shoulder position if needed
+        if is_mirrored:
+            r_shoulder_x = 1 - r_shoulder_x
+
+        # Calculate the vector from shoulder to hand
+        dx = r_hand_x - r_shoulder_x
+        dy = r_hand_y - r_shoulder_y
+
+        # Calculate the distance between shoulder and hand
+        distance = math.sqrt(dx**2 + dy**2)
+
+        # Clamp the distance to the possible range
+        distance = max(self.min_arm_length, min(distance, self.max_arm_length))
+
+        # Normalize the vector
+        if distance > 0:
+            dx /= distance
+            dy /= distance
+
+        # Scale the vector to the clamped distance
+        r_hand_x = r_shoulder_x + dx * distance
+        r_hand_y = r_shoulder_y + dy * distance
+
+        # Calculate elbow position using inverse kinematics
+        cos_elbow = (distance**2 - self.upper_arm_length**2 - self.forearm_length**2) / (2 * self.upper_arm_length * self.forearm_length)
+        cos_elbow = max(-1, min(1, cos_elbow))  # Clamp to valid range
+        elbow_angle = math.acos(cos_elbow)
+
+        guard = self.player_guard_states.get(player_id, False)
+
+        # Calculate shoulder angle
+        if is_mirrored:
+            if guard:
+                shoulder_angle = math.atan2(dy, dx) + math.atan2(self.forearm_length * math.sin(elbow_angle),
+                                                                self.upper_arm_length + self.forearm_length * math.cos(elbow_angle))
+            else:                                    
+                shoulder_angle = math.atan2(dy, dx) - math.atan2(self.forearm_length * math.sin(elbow_angle),
+                                                                self.upper_arm_length + self.forearm_length * math.cos(elbow_angle))                
+        else:
+            if guard:
+                shoulder_angle = math.atan2(dy, dx) - math.atan2(self.forearm_length * math.sin(elbow_angle),
+                                                                self.upper_arm_length + self.forearm_length * math.cos(elbow_angle))
+            else:                                    
+                shoulder_angle = math.atan2(dy, dx) + math.atan2(self.forearm_length * math.sin(elbow_angle),
+                                                                self.upper_arm_length + self.forearm_length * math.cos(elbow_angle))                                                        
+
+        # Calculate elbow position
+        r_elbow_x = r_shoulder_x + self.upper_arm_length * math.cos(shoulder_angle)
+        r_elbow_y = r_shoulder_y + self.upper_arm_length * math.sin(shoulder_angle)
+        
+        # Ensure the forearm length is constrained
+        forearm_dx = r_hand_x - r_elbow_x
+        forearm_dy = r_hand_y - r_elbow_y
+        forearm_length = math.sqrt(forearm_dx**2 + forearm_dy**2)
+        if forearm_length > self.forearm_length:
+            scale_factor = self.forearm_length / forearm_length
+            r_hand_x = r_elbow_x + forearm_dx * scale_factor
+            r_hand_y = r_elbow_y + forearm_dy * scale_factor
+
+        # Apply mirroring to arm positions if needed
+        if is_mirrored:
+            r_shoulder_x = 1 * r_shoulder_x
+            r_elbow_x = 1 * r_elbow_x
+            r_hand_x = 1 * r_hand_x
+
+        # Update pivot points
+        player['pivot_points']['r_shoulder'] = [r_shoulder_x, r_shoulder_y]
+        player['pivot_points']['r_elbow'] = [r_elbow_x, r_elbow_y]
+        player['pivot_points']['r_hand'] = [r_hand_x, r_hand_y]
+
+        # Apply mirroring to other pivot points
+        if is_mirrored:
+            for key, point in player['pivot_points'].items():
+                if key not in ['r_shoulder', 'r_elbow', 'r_hand']:
+                    player['pivot_points'][key] = [1 - point[0], point[1]]
+
+    def update_player_mouse_position(self, player_id, position):
+        if player_id in self.players:
+            self.player_mouse_positions[player_id] = position
+            self.update_pivot_points(self.players[player_id])  # Update pivot points when mouse position changes
+            print(f"Updated mouse position for player {player_id}: {position}")
+
+    def update_player_guard(self, player_id, guard_state):
+        if player_id in self.player_guard_states:
+            self.player_guard_states[player_id] = guard_state
+            print(f"Player guard state updated: id={player_id}, guard={guard_state}")
+
+    def get_state(self):
+        return {player_id: {
+            'x': player['x'],
+            'y': player['y'],
+            'pivot_points': player['pivot_points'],
+            'mouse_position': self.player_mouse_positions.get(player_id, {'x': 0, 'y': 0}),
+            'guard': self.player_guard_states.get(player_id, False),
+            'animation_state': {
+                'current': self.player_animation_states[player_id]['current_state'],
+                'next': self.player_animation_states[player_id]['next_state'],
+                'progress': self.player_animation_states[player_id]['transition_progress'],
+                'direction': self.player_animation_states[player_id]['direction']
+            }
+        } for player_id, player in self.players.items()}
+
+    async def broadcast_state(self):
+        state = self.get_state()
+        print(f"Broadcasting state: {state}")
+        channel_layer = get_channel_layer()
+        await channel_layer.group_send(
+            'game',
+            {
+                'type': 'game.state',
+                'state': json.dumps(state)
+            }
+        )
+        print("State broadcast complete")
+        
+        # Log player mouse positions
+        for player_id, player_state in state.items():
+            mouse_pos = player_state['mouse_position']
+            print(f"Player {player_id} mouse position: X: {mouse_pos['x']:.2f}, Y: {mouse_pos['y']:.2f}")
+
+game_state = GameState()
