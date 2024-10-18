@@ -111,17 +111,6 @@ class AnimationComponent:
 
     def get_crouch_cycle_frame(self, cycle_progress, direction):
         if cycle_progress < 0.5:
-            start_frame = self.get_frame(self.crouch_cycle_frames[0], direction)
-            end_frame = self.get_frame(self.crouch_cycle_frames[1], direction)
-            t = cycle_progress * 2
-        else:
-            start_frame = self.get_frame(self.crouch_cycle_frames[1], direction)
-            end_frame = self.get_frame(self.crouch_cycle_frames[0], direction)
-            t = (cycle_progress - 0.5) * 2
-        return self.bicubic_interpolate(start_frame, end_frame, t)
-
-    def get_crouch_cycle_frame(self, cycle_progress, direction):
-        if cycle_progress < 0.5:
             start_frame = self.get_frame('CROUCH_PASS', direction)
             end_frame = self.get_frame('CROUCH_REACH', direction)
             t = cycle_progress * 2
